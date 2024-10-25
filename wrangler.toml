@@ -112,3 +112,19 @@ enabled = true
 # [[vectorize]]
 # binding = "MY_INDEX"
 # index_name = "my-index"
+
+[vars]
+PROXY_HOSTNAME = "registry-1.docker.io"
+PROXY_PROTOCOL = "https"
+DEBUG = false
+REQUEST_TIMEOUT = 30000
+
+# 可选配置
+# PATHNAME_REGEX = ""
+# UA_WHITELIST_REGEX = ""
+# UA_BLACKLIST_REGEX = ""
+# IP_WHITELIST_REGEX = ""
+# IP_BLACKLIST_REGEX = ""
+# REGION_WHITELIST_REGEX = ""
+# REGION_BLACKLIST_REGEX = ""
+# URL302 = ""

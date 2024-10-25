@@ -117,7 +117,7 @@ enabled = true
 PROXY_HOSTNAME = "registry-1.docker.io"
 PROXY_PROTOCOL = "https"
 DEBUG = false
-REQUEST_TIMEOUT = 30000
+REQUEST_TIMEOUT = 60000
 
 # 可选配置
 # PATHNAME_REGEX = ""

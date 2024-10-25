@@ -96,7 +96,6 @@ PROXY_PROTOCOL = "https"
 REQUEST_TIMEOUT = 60000
 PATHNAME_REGEX = "^/v2/"
 UA_WHITELIST_REGEX = "^docker/\\d+\\.\\d+\\.\\d+.*$"
-IP_BLACKLIST_REGEX = "^(?:10|172\\.(?:1[6-9]|2\\d|3[01])|192\\.168)\\."
 ```
 
 ### 完整配置示例

@@ -16,6 +16,7 @@ class Metrics {
     this.timeouts = 0;
     this.bytesTransferred = 0;
     this.requestTimings = new Map();
+    this.retries = 0;
   }
 
   recordRequestStart(requestId) {
@@ -39,14 +40,20 @@ class Metrics {
     this.timeouts++;
   }
 
+  recordRetry() {
+    this.retries++;
+  }
+
   getMetrics() {
     return {
       requests: this.requests,
       errors: this.errors,
       timeouts: this.timeouts,
+      retries: this.retries,
       bytesTransferred: this.bytesTransferred,
       errorRate: (this.errors / this.requests) || 0,
       timeoutRate: (this.timeouts / this.requests) || 0,
+      retryRate: (this.retries / this.requests) || 0,
       timestamp: new Date().toISOString()
     };
   }
@@ -105,6 +112,11 @@ function isManifestOrBlobRequest(pathname) {
   return pathname.includes('/manifests/') || pathname.includes('/blobs/');
 }
 
+// 判断是否为认证请求
+function isAuthRequest(pathname) {
+  return pathname.includes('/token') || pathname.includes('/auth');
+}
+
 // 处理响应内容
 async function processResponseBody(response, proxyHostname, pathnameRegex, originHostname) {
   const contentType = response.headers.get('content-type') || '';
@@ -149,7 +161,11 @@ function sanitizeHeaders(headers) {
     'content-length',
     'content-type',
     'x-content-type-options',
-    'cache-control'
+    'cache-control',
+    'www-authenticate',
+    'authorization',
+    'range',
+    'accept-ranges'
   ];
 
   for (const header of dockerHeaders) {
@@ -159,6 +175,7 @@ function sanitizeHeaders(headers) {
     }
   }
   
+  // 设置基本安全头
   newHeaders.set('X-Content-Type-Options', 'nosniff');
   newHeaders.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   
@@ -199,35 +216,62 @@ function logRequest(request, response, requestId, duration) {
 }
 
 // 超时处理的fetch
-async function fetchWithTimeout(request, pathname, timeout = 60000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+async function fetchWithTimeout(request, pathname, timeout = 60000, retries = 3) {
+  let lastError;
   
-  try {
-    const isManifestOrBlob = isManifestOrBlobRequest(pathname);
-    const response = await fetch(request, { 
-      signal: controller.signal,
-      cf: {
-        cacheTtl: isManifestOrBlob ? 600 : 300,
-        cacheEverything: true,
-        connectTimeout: 30,
-        retries: 3
+  for (let i = 0; i < retries; i++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      const response = await fetch(request, {
+        signal: controller.signal,
+        cf: {
+          cacheTtl: isManifestOrBlobRequest(pathname) ? 600 : 300,
+          cacheEverything: true,
+          connectTimeout: 30,
+          retries: 2
+        }
+      });
+      clearTimeout(timeoutId);
+
+      // 检查是否需要认证
+      if (response.status === 401) {
+        return response;  // 直接返回 401 响应，让客户端处理认证
       }
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      metrics.recordTimeout();
-      throw new ProxyError(
-        `Request timeout after ${timeout}ms`,
-        504,
-        'REQUEST_TIMEOUT'
-      );
+      
+      // 对于其他错误响应，如果还有重试次数，继续重试
+      if (!response.ok && i < retries - 1) {
+        metrics.recordRetry();
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        continue;
+      }
+      
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      lastError = error;
+      
+      if (error.name === 'AbortError') {
+        metrics.recordTimeout();
+        throw new ProxyError(
+          `Request timeout after ${timeout}ms`,
+          504,
+          'REQUEST_TIMEOUT'
+        );
+      }
+      
+      if (i === retries - 1) {
+        throw error;
+      }
+      
+      metrics.recordRetry();
+      // 等待一段时间后重试
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
     }
-    throw error;
   }
+  
+  throw lastError;
 }
 
 // 创建新请求
@@ -248,26 +292,41 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
     }
   }
 
-  // 处理 manifest 和 blob 请求的特殊头部
+  // 添加 Docker Registry API 版本头
+  newRequestHeaders.set('Docker-Distribution-API-Version', 'registry/2.0');
+
+  // 处理 v2 API 请求
   if (pathname.startsWith('/v2')) {
     if (pathname.includes('/manifests/')) {
       // 设置 manifest 请求的 Accept 头
-      newRequestHeaders.set('Accept', [
+      const acceptTypes = [
         'application/vnd.docker.distribution.manifest.v2+json',
         'application/vnd.docker.distribution.manifest.list.v2+json',
         'application/vnd.oci.image.manifest.v1+json',
         'application/vnd.oci.image.index.v1+json',
+        'application/vnd.docker.distribution.manifest.v1+prettyjws',
+        'application/json',
         '*/*'
-      ].join(', '));
+      ];
+      newRequestHeaders.set('Accept', acceptTypes.join(', '));
     } else if (pathname.includes('/blobs/')) {
       // 设置 blob 请求的 Accept 头
-      newRequestHeaders.set('Accept', [
+      const acceptTypes = [
         'application/vnd.docker.image.rootfs.diff.tar.gzip',
         'application/vnd.docker.container.image.v1+json',
+        'application/vnd.oci.image.layer.v1.tar+gzip',
+        'application/vnd.oci.image.config.v1+json',
         'application/octet-stream',
         '*/*'
-      ].join(', '));
+      ];
+      newRequestHeaders.set('Accept', acceptTypes.join(', '));
     }
+  }
+
+  // 保留原始请求的 Range 头（如果存在）
+  const rangeHeader = request.headers.get('range');
+  if (rangeHeader) {
+    newRequestHeaders.set('Range', rangeHeader);
   }
 
   return new Request(url.toString(), {
@@ -307,19 +366,28 @@ function setResponseHeaders(
   // 处理 Docker 认证 URL
   let dockerAuthUrl = newResponseHeaders.get("www-authenticate");
   if (dockerAuthUrl) {
-    if (dockerAuthUrl.includes("auth.docker.io/token")) {
-      newResponseHeaders.set(
-        "www-authenticate",
-        dockerAuthUrl.replace("auth.docker.io/token", originHostname + "/token")
-      );
-    }
-    // 处理其他可能的认证 URL
-    if (dockerAuthUrl.includes("registry-1.docker.io")) {
-      newResponseHeaders.set(
-        "www-authenticate",
-        dockerAuthUrl.replace("registry-1.docker.io", originHostname)
-      );
-    }
+    const modifiedAuthUrl = dockerAuthUrl
+      .replace(/auth\.docker\.io(:\d+)?/g, originHostname)
+      .replace(/registry-1\.docker\.io(:\d+)?/g, originHostname)
+      .replace(/index\.docker\.io(:\d+)?/g, originHostname);
+    
+    newResponseHeaders.set("www-authenticate", modifiedAuthUrl);
+  }
+
+  // 确保正确设置 Content-Type
+  const contentType = originalResponse.headers.get('content-type');
+  if (contentType) {
+    newResponseHeaders.set('Content-Type', contentType);
+  }
+
+  // 处理分块下载
+  const contentRange = originalResponse.headers.get('content-range');
+  if (contentRange) {
+    newResponseHeaders.set('Content-Range', contentRange);
+  }
+  const acceptRanges = originalResponse.headers.get('accept-ranges');
+  if (acceptRanges) {
+    newResponseHeaders.set('Accept-Ranges', acceptRanges);
   }
 
   return newResponseHeaders;
@@ -375,7 +443,8 @@ export default {
         REGION_WHITELIST_REGEX,
         REGION_BLACKLIST_REGEX,
         DEBUG = false,
-        REQUEST_TIMEOUT = 60000
+        REQUEST_TIMEOUT = 60000,
+        MAX_RETRIES = 3
       } = env;
 
       const url = new URL(request.url);
@@ -451,12 +520,32 @@ export default {
           headers: Object.fromEntries(newRequest.headers),
           pathname: pathname,
           isManifest: pathname.includes("/manifests/"),
-          isBlob: pathname.includes("/blobs/")
+          isBlob: pathname.includes("/blobs/"),
+          isAuth: isAuthRequest(pathname)
         });
       }
 
-      const originalResponse = await fetchWithTimeout(newRequest, pathname, REQUEST_TIMEOUT);
+      const originalResponse = await fetchWithTimeout(newRequest, pathname, REQUEST_TIMEOUT, MAX_RETRIES);
       
+      // 对于 401 响应，需要特殊处理确保认证头被正确设置
+      if (originalResponse.status === 401) {
+        const response = new Response(originalResponse.body, {
+          status: 401,
+          headers: setResponseHeaders(originalResponse, PROXY_HOSTNAME, originHostname, DEBUG)
+        });
+        
+        if (DEBUG) {
+          console.log('Debug - Auth Required:', {
+            status: response.status,
+            headers: Object.fromEntries(response.headers)
+          });
+        }
+        
+        const duration = metrics.recordRequestEnd(requestId);
+        logRequest(request, response, requestId, duration);
+        return response;
+      }
+
       const processedResponse = await processResponseBody(
         originalResponse.clone(),
         PROXY_HOSTNAME,
@@ -484,6 +573,7 @@ export default {
           status: response.status,
           headers: Object.fromEntries(response.headers),
           contentType: response.headers.get('content-type'),
+          contentLength: response.headers.get('content-length'),
           isManifestOrBlob: isManifestOrBlobRequest(pathname)
         });
       }

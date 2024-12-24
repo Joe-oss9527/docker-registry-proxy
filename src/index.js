@@ -104,7 +104,10 @@ function validateConfig(env) {
 async function processResponseBody(response, proxyHostname, pathnameRegex, originHostname) {
   const contentType = response.headers.get('content-type') || '';
   
-  if (!contentType.includes('text/')) {
+  // 对于二进制内容（如 blobs），直接返回
+  if (contentType.includes('application/octet-stream') || 
+      contentType.includes('application/vnd.docker.') ||
+      !contentType.includes('text/')) {
     return response;
   }
 
@@ -133,6 +136,15 @@ function sanitizeHeaders(headers) {
     newHeaders.delete(header);
   }
   
+  // 保留 Docker 相关的重要头部
+  const dockerHeaders = ['docker-distribution-api-version', 'docker-content-digest'];
+  for (const header of dockerHeaders) {
+    const value = headers.get(header);
+    if (value) {
+      newHeaders.set(header, value);
+    }
+  }
+  
   newHeaders.set('X-Content-Type-Options', 'nosniff');
   newHeaders.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   
@@ -149,22 +161,27 @@ function logError(request, error, requestId) {
     clientIp: request.headers.get("cf-connecting-ip"),
     userAgent: request.headers.get("user-agent"),
     url: request.url,
+    pathname: new URL(request.url).pathname,
     timestamp: new Date().toISOString()
   };
   console.error(JSON.stringify(errorInfo));
 }
 
-function logRequest(request, requestId, duration, status) {
-  console.log(JSON.stringify({
+function logRequest(request, response, requestId, duration) {
+  const logInfo = {
     requestId,
     method: request.method,
     url: request.url,
-    status,
+    pathname: new URL(request.url).pathname,
+    status: response.status,
     duration,
+    contentType: response.headers.get('content-type'),
+    contentLength: response.headers.get('content-length'),
     userAgent: request.headers.get('user-agent'),
     clientIp: request.headers.get('cf-connecting-ip'),
     timestamp: new Date().toISOString()
-  }));
+  };
+  console.log(JSON.stringify(logInfo));
 }
 
 // 超时处理的fetch
@@ -179,7 +196,7 @@ async function fetchWithTimeout(request, timeout = 60000) {
         cacheTtl: 300,
         cacheEverything: true,
         connectTimeout: 20,
-        retries: 2
+        retries: 3
       }
     });
     clearTimeout(timeoutId);
@@ -201,6 +218,8 @@ async function fetchWithTimeout(request, timeout = 60000) {
 // 创建新请求
 function createNewRequest(request, url, proxyHostname, originHostname) {
   const newRequestHeaders = sanitizeHeaders(request.headers);
+  
+  // 处理请求头中的主机名替换
   for (const [key, value] of newRequestHeaders) {
     if (value.includes(originHostname)) {
       newRequestHeaders.set(
@@ -212,6 +231,12 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
       );
     }
   }
+
+  // 确保正确设置 Accept 头部
+  if (!newRequestHeaders.has('Accept')) {
+    newRequestHeaders.set('Accept', '*/*');
+  }
+
   return new Request(url.toString(), {
     method: request.method,
     headers: newRequestHeaders,
@@ -227,6 +252,8 @@ function setResponseHeaders(
   DEBUG
 ) {
   const newResponseHeaders = sanitizeHeaders(originalResponse.headers);
+
+  // 处理响应头中的主机名替换
   for (const [key, value] of newResponseHeaders) {
     if (value.includes(proxyHostname)) {
       newResponseHeaders.set(
@@ -238,19 +265,25 @@ function setResponseHeaders(
       );
     }
   }
+
+  // Debug 模式下移除 CSP
   if (DEBUG) {
     newResponseHeaders.delete("content-security-policy");
   }
-  let docker_auth_url = newResponseHeaders.get("www-authenticate");
-  if (docker_auth_url && docker_auth_url.includes("auth.docker.io/token")) {
+
+  // 处理 Docker 认证 URL
+  let dockerAuthUrl = newResponseHeaders.get("www-authenticate");
+  if (dockerAuthUrl && dockerAuthUrl.includes("auth.docker.io/token")) {
     newResponseHeaders.set(
       "www-authenticate",
-      docker_auth_url.replace("auth.docker.io/token", originHostname + "/token")
+      dockerAuthUrl.replace("auth.docker.io/token", originHostname + "/token")
     );
   }
+
   return newResponseHeaders;
 }
 
+// Nginx 默认页面
 async function nginx() {
   return `<!DOCTYPE html>
 <html>
@@ -306,11 +339,13 @@ export default {
       const url = new URL(request.url);
       const originHostname = url.hostname;
 
-      // 设置正确的代理主机名
+      // 根据路径设置正确的代理主机名
       if (url.pathname.includes("/token")) {
         PROXY_HOSTNAME = "auth.docker.io";
       } else if (url.pathname.includes("/search")) {
         PROXY_HOSTNAME = "index.docker.io";
+      } else if (url.pathname.startsWith("/v2") && url.pathname.includes("/blobs/")) {
+        PROXY_HOSTNAME = "registry-1.docker.io";
       }
 
       // 访问控制检查
@@ -342,7 +377,8 @@ export default {
             request.headers.get("cf-ipcountry")
           ))
       ) {
-        logError(request, new ProxyError("Access denied", 403, "ACCESS_DENIED"), requestId);
+        const error = new ProxyError("Access denied", 403, "ACCESS_DENIED");
+        logError(request, error, requestId);
         metrics.recordError();
         return URL302
           ? Response.redirect(URL302, 302)
@@ -353,15 +389,26 @@ export default {
             });
       }
 
+      // 设置目标 URL
       url.host = PROXY_HOSTNAME;
       url.protocol = PROXY_PROTOCOL;
 
+      // 创建并发送新请求
       const newRequest = createNewRequest(
         request,
         url,
         PROXY_HOSTNAME,
         originHostname
       );
+
+      if (DEBUG) {
+        console.log('Debug - Request:', {
+          url: url.toString(),
+          method: newRequest.method,
+          headers: Object.fromEntries(newRequest.headers),
+          pathname: url.pathname
+        });
+      }
 
       const originalResponse = await fetchWithTimeout(newRequest, REQUEST_TIMEOUT);
       
@@ -385,16 +432,26 @@ export default {
       });
 
       const duration = metrics.recordRequestEnd(requestId);
-      logRequest(request, requestId, duration, response.status);
+      logRequest(request, response, requestId, duration);
+
+      if (DEBUG) {
+        console.log('Debug - Response:', {
+          status: response.status,
+          headers: Object.fromEntries(response.headers),
+          contentType: response.headers.get('content-type')
+        });
+      }
 
       return response;
     } catch (error) {
       metrics.recordError();
       metrics.recordRequestEnd(requestId);
       logError(request, error, requestId);
+      
       return new Response(
         JSON.stringify({ 
           error: error.message,
+          type: error.errorType || 'UNKNOWN_ERROR',
           requestId 
         }),
         { 

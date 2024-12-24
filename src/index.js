@@ -100,13 +100,19 @@ function validateConfig(env) {
   }
 }
 
+// 判断请求类型
+function isManifestOrBlobRequest(pathname) {
+  return pathname.includes('/manifests/') || pathname.includes('/blobs/');
+}
+
 // 处理响应内容
 async function processResponseBody(response, proxyHostname, pathnameRegex, originHostname) {
   const contentType = response.headers.get('content-type') || '';
   
-  // 对于二进制内容（如 blobs），直接返回
+  // 对于二进制内容和 Docker 特定内容类型，直接返回
   if (contentType.includes('application/octet-stream') || 
       contentType.includes('application/vnd.docker.') ||
+      contentType.includes('application/vnd.oci.') ||
       !contentType.includes('text/')) {
     return response;
   }
@@ -137,7 +143,15 @@ function sanitizeHeaders(headers) {
   }
   
   // 保留 Docker 相关的重要头部
-  const dockerHeaders = ['docker-distribution-api-version', 'docker-content-digest'];
+  const dockerHeaders = [
+    'docker-distribution-api-version',
+    'docker-content-digest',
+    'content-length',
+    'content-type',
+    'x-content-type-options',
+    'cache-control'
+  ];
+
   for (const header of dockerHeaders) {
     const value = headers.get(header);
     if (value) {
@@ -185,17 +199,18 @@ function logRequest(request, response, requestId, duration) {
 }
 
 // 超时处理的fetch
-async function fetchWithTimeout(request, timeout = 60000) {
+async function fetchWithTimeout(request, pathname, timeout = 60000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   
   try {
+    const isManifestOrBlob = isManifestOrBlobRequest(pathname);
     const response = await fetch(request, { 
       signal: controller.signal,
       cf: {
-        cacheTtl: 300,
+        cacheTtl: isManifestOrBlob ? 600 : 300,
         cacheEverything: true,
-        connectTimeout: 20,
+        connectTimeout: 30,
         retries: 3
       }
     });
@@ -218,6 +233,7 @@ async function fetchWithTimeout(request, timeout = 60000) {
 // 创建新请求
 function createNewRequest(request, url, proxyHostname, originHostname) {
   const newRequestHeaders = sanitizeHeaders(request.headers);
+  const pathname = url.pathname;
   
   // 处理请求头中的主机名替换
   for (const [key, value] of newRequestHeaders) {
@@ -232,9 +248,26 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
     }
   }
 
-  // 确保正确设置 Accept 头部
-  if (!newRequestHeaders.has('Accept')) {
-    newRequestHeaders.set('Accept', '*/*');
+  // 处理 manifest 和 blob 请求的特殊头部
+  if (pathname.startsWith('/v2')) {
+    if (pathname.includes('/manifests/')) {
+      // 设置 manifest 请求的 Accept 头
+      newRequestHeaders.set('Accept', [
+        'application/vnd.docker.distribution.manifest.v2+json',
+        'application/vnd.docker.distribution.manifest.list.v2+json',
+        'application/vnd.oci.image.manifest.v1+json',
+        'application/vnd.oci.image.index.v1+json',
+        '*/*'
+      ].join(', '));
+    } else if (pathname.includes('/blobs/')) {
+      // 设置 blob 请求的 Accept 头
+      newRequestHeaders.set('Accept', [
+        'application/vnd.docker.image.rootfs.diff.tar.gzip',
+        'application/vnd.docker.container.image.v1+json',
+        'application/octet-stream',
+        '*/*'
+      ].join(', '));
+    }
   }
 
   return new Request(url.toString(), {
@@ -273,11 +306,20 @@ function setResponseHeaders(
 
   // 处理 Docker 认证 URL
   let dockerAuthUrl = newResponseHeaders.get("www-authenticate");
-  if (dockerAuthUrl && dockerAuthUrl.includes("auth.docker.io/token")) {
-    newResponseHeaders.set(
-      "www-authenticate",
-      dockerAuthUrl.replace("auth.docker.io/token", originHostname + "/token")
-    );
+  if (dockerAuthUrl) {
+    if (dockerAuthUrl.includes("auth.docker.io/token")) {
+      newResponseHeaders.set(
+        "www-authenticate",
+        dockerAuthUrl.replace("auth.docker.io/token", originHostname + "/token")
+      );
+    }
+    // 处理其他可能的认证 URL
+    if (dockerAuthUrl.includes("registry-1.docker.io")) {
+      newResponseHeaders.set(
+        "www-authenticate",
+        dockerAuthUrl.replace("registry-1.docker.io", originHostname)
+      );
+    }
   }
 
   return newResponseHeaders;
@@ -338,20 +380,21 @@ export default {
 
       const url = new URL(request.url);
       const originHostname = url.hostname;
+      const pathname = url.pathname;
 
       // 根据路径设置正确的代理主机名
-      if (url.pathname.includes("/token")) {
+      if (pathname.includes("/token")) {
         PROXY_HOSTNAME = "auth.docker.io";
-      } else if (url.pathname.includes("/search")) {
+      } else if (pathname.includes("/search")) {
         PROXY_HOSTNAME = "index.docker.io";
-      } else if (url.pathname.startsWith("/v2") && url.pathname.includes("/blobs/")) {
+      } else if (pathname.startsWith("/v2") && isManifestOrBlobRequest(pathname)) {
         PROXY_HOSTNAME = "registry-1.docker.io";
       }
 
       // 访问控制检查
       if (
         !PROXY_HOSTNAME ||
-        (PATHNAME_REGEX && !getCachedRegex(PATHNAME_REGEX).test(url.pathname)) ||
+        (PATHNAME_REGEX && !getCachedRegex(PATHNAME_REGEX).test(pathname)) ||
         (UA_WHITELIST_REGEX &&
           !getCachedRegex(UA_WHITELIST_REGEX).test(
             request.headers.get("user-agent")?.toLowerCase() || ''
@@ -406,11 +449,13 @@ export default {
           url: url.toString(),
           method: newRequest.method,
           headers: Object.fromEntries(newRequest.headers),
-          pathname: url.pathname
+          pathname: pathname,
+          isManifest: pathname.includes("/manifests/"),
+          isBlob: pathname.includes("/blobs/")
         });
       }
 
-      const originalResponse = await fetchWithTimeout(newRequest, REQUEST_TIMEOUT);
+      const originalResponse = await fetchWithTimeout(newRequest, pathname, REQUEST_TIMEOUT);
       
       const processedResponse = await processResponseBody(
         originalResponse.clone(),
@@ -438,7 +483,8 @@ export default {
         console.log('Debug - Response:', {
           status: response.status,
           headers: Object.fromEntries(response.headers),
-          contentType: response.headers.get('content-type')
+          contentType: response.headers.get('content-type'),
+          isManifestOrBlob: isManifestOrBlobRequest(pathname)
         });
       }
 

@@ -106,10 +106,6 @@ docker search dockerhub.xxx.com/image_name
 
 GPL-3.0 License
 
-## 问题反馈
-
-如有问题，请提交 Issue 或查看 [cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy) 项目获取更多参考。
-
 ---
 
 > 注：本项目仅供学习研究使用，请遵守相关法律法规。

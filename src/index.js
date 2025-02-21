@@ -279,6 +279,11 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
   const newRequestHeaders = sanitizeHeaders(request.headers);
   const pathname = url.pathname;
   
+  // 添加 S3 必需的 SHA256 头
+  if (pathname.includes('/blobs/')) {
+    newRequestHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
+  }
+  
   // 处理请求头中的主机名替换
   for (const [key, value] of newRequestHeaders) {
     if (value.includes(originHostname)) {

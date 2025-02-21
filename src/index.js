@@ -71,11 +71,7 @@ function getCachedRegex(pattern, flags = 'g') {
 
 // 配置验证
 function validateConfig(env) {
-  const requiredConfigs = [
-    'PROXY_HOSTNAME',
-    'AWS_ACCESS_KEY',
-    'AWS_SECRET_KEY'
-  ];
+  const requiredConfigs = ['PROXY_HOSTNAME'];
   const missingConfigs = requiredConfigs.filter(key => !env[key]);
 
   if (missingConfigs.length > 0) {
@@ -234,10 +230,28 @@ async function fetchWithTimeout(request, pathname, timeout = 60000, retries = 3)
           cacheTtl: isManifestOrBlobRequest(pathname) ? 600 : 300,
           cacheEverything: true,
           connectTimeout: 30,
-          retries: 2
+          retries: 2,
+          mirage: true,
+          polish: "off"
         }
       });
       clearTimeout(timeoutId);
+
+      // 对于 blob 请求的特殊错误处理
+      if (pathname.includes('/blobs/') && response.status === 400) {
+        const text = await response.text();
+        if (text.includes('Missing x-amz-content-sha256')) {
+          // 重新创建请求并重试
+          const newHeaders = new Headers(request.headers);
+          newHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
+          const newRequest = new Request(request.url, {
+            method: request.method,
+            headers: newHeaders,
+            body: request.body
+          });
+          return fetchWithTimeout(newRequest, pathname, timeout, retries - i - 1);
+        }
+      }
 
       // 检查是否需要认证
       if (response.status === 401) {
@@ -278,102 +292,10 @@ async function fetchWithTimeout(request, pathname, timeout = 60000, retries = 3)
   throw lastError;
 }
 
-// AWS V4 签名相关函数
-async function hmac(key, message) {
-  const keyBytes = typeof key === 'string' ? 
-    new TextEncoder().encode(key) : key;
-  const messageBytes = typeof message === 'string' ? 
-    new TextEncoder().encode(message) : message;
-
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw', 
-    keyBytes,
-    {
-      name: 'HMAC',
-      hash: { name: 'SHA-256' }
-    },
-    true,
-    ['sign']
-  );
-
-  const signature = await crypto.subtle.sign(
-    'HMAC',
-    cryptoKey,
-    messageBytes
-  );
-
-  return new Uint8Array(signature);
-}
-
-async function getSignatureKey(key, dateStamp, regionName, serviceName) {
-  const kDate = await hmac('AWS4' + key, dateStamp);
-  const kRegion = await hmac(kDate, regionName);
-  const kService = await hmac(kRegion, serviceName);
-  const kSigning = await hmac(kService, 'aws4_request');
-  return kSigning;
-}
-
-async function createAWSSignature(request, env, region = 'us-east-1', service = 's3') {
-  const timestamp = new Date();
-  const dateStamp = timestamp.toISOString().split('T')[0].replace(/-/g, '');
-  const amzDate = dateStamp + 'T' + timestamp.toTimeString().split(' ')[0].replace(/:/g, '') + 'Z';
-  
-  const canonicalUri = new URL(request.url).pathname;
-  const canonicalQueryString = new URL(request.url).search.slice(1);
-  const canonicalHeaders = 
-    'host:' + new URL(request.url).host + '\n' +
-    'x-amz-content-sha256:UNSIGNED-PAYLOAD\n' +
-    'x-amz-date:' + amzDate + '\n';
-  
-  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
-  const canonicalRequest = request.method + '\n' +
-    canonicalUri + '\n' +
-    canonicalQueryString + '\n' +
-    canonicalHeaders + '\n' +
-    signedHeaders + '\n' +
-    'UNSIGNED-PAYLOAD';
-
-  const algorithm = 'AWS4-HMAC-SHA256';
-  const credentialScope = dateStamp + '/' + region + '/' + service + '/aws4_request';
-  const stringToSign = algorithm + '\n' +
-    amzDate + '\n' +
-    credentialScope + '\n' +
-    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalRequest));
-
-  const stringToSignBytes = new TextEncoder().encode(stringToSign);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', stringToSignBytes);
-  const hashHex = Array.from(new Uint8Array(hashBuffer))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-
-  const signingKey = await getSignatureKey(env.AWS_SECRET_KEY, dateStamp, region, service);
-  const signature = await hmac(signingKey, hashHex);
-  const signatureHex = Array.from(signature)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-
-  return {
-    authorization: algorithm + ' ' +
-      'Credential=' + env.AWS_ACCESS_KEY + '/' + credentialScope + ',' +
-      'SignedHeaders=' + signedHeaders + ',' +
-      'Signature=' + signatureHex,
-    amzDate: amzDate
-  };
-}
-
 // 创建新请求
-async function createNewRequest(request, url, proxyHostname, originHostname, env) {
+function createNewRequest(request, url, proxyHostname, originHostname) {
   const newRequestHeaders = sanitizeHeaders(request.headers);
   const pathname = url.pathname;
-  
-  // 添加 S3 必需的头部
-  if (pathname.includes('/blobs/')) {
-    const { authorization, amzDate } = await createAWSSignature(request, env);
-    
-    newRequestHeaders.set('Authorization', authorization);
-    newRequestHeaders.set('x-amz-date', amzDate);
-    newRequestHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
-  }
   
   // 处理请求头中的主机名替换
   for (const [key, value] of newRequestHeaders) {
@@ -423,6 +345,15 @@ async function createNewRequest(request, url, proxyHostname, originHostname, env
   const rangeHeader = request.headers.get('range');
   if (rangeHeader) {
     newRequestHeaders.set('Range', rangeHeader);
+  }
+
+  // 添加 S3 必需的请求头
+  if (pathname.includes('/blobs/')) {
+    newRequestHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
+    // 如果是 GET 请求，添加额外的 S3 头
+    if (request.method === 'GET') {
+      newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''));
+    }
   }
 
   return new Request(url.toString(), {
@@ -602,12 +533,11 @@ export default {
       url.protocol = PROXY_PROTOCOL;
 
       // 创建并发送新请求
-      const newRequest = await createNewRequest(
+      const newRequest = createNewRequest(
         request,
         url,
         PROXY_HOSTNAME,
-        originHostname,
-        env
+        originHostname
       );
 
       if (DEBUG) {
@@ -628,7 +558,7 @@ export default {
       if (originalResponse.status === 401) {
         const response = new Response(originalResponse.body, {
           status: 401,
-          headers: await setResponseHeaders(originalResponse, PROXY_HOSTNAME, originHostname, DEBUG)
+          headers: setResponseHeaders(originalResponse, PROXY_HOSTNAME, originHostname, DEBUG)
         });
         
         if (DEBUG) {
@@ -650,7 +580,7 @@ export default {
         originHostname
       );
 
-      const newResponseHeaders = await setResponseHeaders(
+      const newResponseHeaders = setResponseHeaders(
         processedResponse,
         PROXY_HOSTNAME,
         originHostname,

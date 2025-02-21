@@ -2,7 +2,7 @@
 name = "docker-registry-proxy"
 main = "src/index.js"
 compatibility_date = "2024-10-22"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "streams_enable_constructors"]
 
 # Workers Logs
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
@@ -25,7 +25,7 @@ enabled = true
 # [vars]
 # MY_VARIABLE = "production_value"
 
-# Bind the Workers AI model catalog. Run machine learning models, powered by serverless GPUs, on Cloudflare’s global network
+# Bind the Workers AI model catalog. Run machine learning models, powered by serverless GPUs, on Cloudflare's global network
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#workers-ai
 # [ai]
 # binding = "AI"
@@ -40,7 +40,7 @@ enabled = true
 # [browser]
 # binding = "MY_BROWSER"
 
-# Bind a D1 database. D1 is Cloudflare’s native serverless SQL database.
+# Bind a D1 database. D1 is Cloudflare's native serverless SQL database.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#d1-databases
 # [[d1_databases]]
 # binding = "MY_DB"
@@ -117,7 +117,8 @@ enabled = true
 PROXY_HOSTNAME = "registry-1.docker.io"
 PROXY_PROTOCOL = "https"
 DEBUG = false
-REQUEST_TIMEOUT = 60000
+REQUEST_TIMEOUT = 120000
+MAX_RETRIES = 6
 
 # 可选配置
 # PATHNAME_REGEX = ""

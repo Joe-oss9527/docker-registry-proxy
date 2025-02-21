@@ -279,9 +279,16 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
   const newRequestHeaders = sanitizeHeaders(request.headers);
   const pathname = url.pathname;
   
-  // 添加 S3 必需的 SHA256 头
+  // 添加 S3 必需的头部
   if (pathname.includes('/blobs/')) {
+    // 生成 ISO 格式的时间戳，格式为: YYYYMMDDTHHMMSSZ
+    const amzDate = new Date().toISOString()
+      .replace(/[-:]/g, '')  // 移除破折号和冒号
+      .replace(/\.\d{3}/, ''); // 移除毫秒
+    
+    newRequestHeaders.set('x-amz-date', amzDate);
     newRequestHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
+    newRequestHeaders.set('date', new Date().toUTCString());
   }
   
   // 处理请求头中的主机名替换

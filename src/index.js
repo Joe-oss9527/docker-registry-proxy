@@ -279,16 +279,29 @@ async function fetchWithTimeout(request, pathname, timeout = 60000, retries = 3)
 }
 
 // AWS V4 签名相关函数
-async function hmac(key, string) {
+async function hmac(key, message) {
+  const keyBytes = typeof key === 'string' ? 
+    new TextEncoder().encode(key) : key;
+  const messageBytes = typeof message === 'string' ? 
+    new TextEncoder().encode(message) : message;
+
   const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    typeof key === 'string' ? new TextEncoder().encode(key) : key,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
+    'raw', 
+    keyBytes,
+    {
+      name: 'HMAC',
+      hash: { name: 'SHA-256' }
+    },
+    true,
     ['sign']
   );
-  const message = new TextEncoder().encode(string);
-  const signature = await crypto.subtle.sign('HMAC', cryptoKey, message);
+
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    cryptoKey,
+    messageBytes
+  );
+
   return new Uint8Array(signature);
 }
 
@@ -327,8 +340,14 @@ async function createAWSSignature(request, env, region = 'us-east-1', service = 
     credentialScope + '\n' +
     await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalRequest));
 
+  const stringToSignBytes = new TextEncoder().encode(stringToSign);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', stringToSignBytes);
+  const hashHex = Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+
   const signingKey = await getSignatureKey(env.AWS_SECRET_KEY, dateStamp, region, service);
-  const signature = await hmac(signingKey, stringToSign);
+  const signature = await hmac(signingKey, hashHex);
   const signatureHex = Array.from(signature)
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');

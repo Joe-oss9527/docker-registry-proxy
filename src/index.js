@@ -230,28 +230,10 @@ async function fetchWithTimeout(request, pathname, timeout = 60000, retries = 3)
           cacheTtl: isManifestOrBlobRequest(pathname) ? 600 : 300,
           cacheEverything: true,
           connectTimeout: 30,
-          retries: 2,
-          mirage: true,
-          polish: "off"
+          retries: 2
         }
       });
       clearTimeout(timeoutId);
-
-      // 对于 blob 请求的特殊错误处理
-      if (pathname.includes('/blobs/') && response.status === 400) {
-        const text = await response.text();
-        if (text.includes('Missing x-amz-content-sha256')) {
-          // 重新创建请求并重试
-          const newHeaders = new Headers(request.headers);
-          newHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
-          const newRequest = new Request(request.url, {
-            method: request.method,
-            headers: newHeaders,
-            body: request.body
-          });
-          return fetchWithTimeout(newRequest, pathname, timeout, retries - i - 1);
-        }
-      }
 
       // 检查是否需要认证
       if (response.status === 401) {
@@ -345,15 +327,6 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
   const rangeHeader = request.headers.get('range');
   if (rangeHeader) {
     newRequestHeaders.set('Range', rangeHeader);
-  }
-
-  // 添加 S3 必需的请求头
-  if (pathname.includes('/blobs/')) {
-    newRequestHeaders.set('x-amz-content-sha256', 'UNSIGNED-PAYLOAD');
-    // 如果是 GET 请求，添加额外的 S3 头
-    if (request.method === 'GET') {
-      newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''));
-    }
   }
 
   return new Request(url.toString(), {

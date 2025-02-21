@@ -293,7 +293,7 @@ async function getSignatureKey(key, dateStamp, regionName, serviceName) {
   return kSigning;
 }
 
-async function createAWSSignature(request, region = 'us-east-1', service = 's3') {
+async function createAWSSignature(request, env, region = 'us-east-1', service = 's3') {
   const timestamp = new Date();
   const dateStamp = timestamp.toISOString().split('T')[0].replace(/-/g, '');
   const amzDate = dateStamp + 'T' + timestamp.toTimeString().split(' ')[0].replace(/:/g, '') + 'Z';
@@ -333,13 +333,13 @@ async function createAWSSignature(request, region = 'us-east-1', service = 's3')
 }
 
 // 创建新请求
-async function createNewRequest(request, url, proxyHostname, originHostname) {
+async function createNewRequest(request, url, proxyHostname, originHostname, env) {
   const newRequestHeaders = sanitizeHeaders(request.headers);
   const pathname = url.pathname;
   
   // 添加 S3 必需的头部
   if (pathname.includes('/blobs/')) {
-    const { authorization, amzDate } = await createAWSSignature(request);
+    const { authorization, amzDate } = await createAWSSignature(request, env);
     
     newRequestHeaders.set('Authorization', authorization);
     newRequestHeaders.set('x-amz-date', amzDate);
@@ -577,7 +577,8 @@ export default {
         request,
         url,
         PROXY_HOSTNAME,
-        originHostname
+        originHostname,
+        env
       );
 
       if (DEBUG) {

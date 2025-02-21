@@ -2,6 +2,8 @@
 
 一个基于 Cloudflare Workers 的轻量级、高性能 Docker 镜像代理服务。它为 Docker Registry 提供稳定的代理访问，具有超时处理、指标收集、访问控制等功能。
 
+> 本项目参考了 [cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy) 的实现。
+
 ## 功能特性
 
 ### 核心功能
@@ -24,202 +26,90 @@
 
 ## 快速开始
 
-### 部署要求
-- Cloudflare Workers 账号
-- 已添加到 Cloudflare 的域名
+### 部署方式
 
-### 安装步骤
+1. Workers 方式：直接复制 src/index.js 内容到 Cloudflare Workers
+2. Pages 方式：Fork 仓库，在 Cloudflare Pages 中连接 GitHub 一键部署
 
-1. 克隆项目
+### 环境变量配置
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|-------|-----|--------|------|
+| PROXY_HOSTNAME | 是 | registry-1.docker.io | 代理地址 hostname |
+| PROXY_PROTOCOL | 否 | https | 代理协议 |
+| PATHNAME_REGEX | 否 | - | 路径过滤正则 |
+| UA_WHITELIST_REGEX | 否 | - | UA白名单正则 |
+| UA_BLACKLIST_REGEX | 否 | - | UA黑名单正则 |
+| IP_WHITELIST_REGEX | 否 | - | IP白名单正则 |
+| IP_BLACKLIST_REGEX | 否 | - | IP黑名单正则 |
+| REGION_WHITELIST_REGEX | 否 | - | 地区白名单正则 |
+| REGION_BLACKLIST_REGEX | 否 | - | 地区黑名单正则 |
+| DEBUG | 否 | false | 调试模式 |
+| URL302 | 否 | - | 访问被拒绝时跳转地址 |
+
+## 镜像仓库支持
+
+支持代理以下镜像仓库：
+
+| 镜像仓库 | 地址 |
+|---------|------|
+| Docker Hub | registry-1.docker.io |
+| k8s.gcr.io | k8s.gcr.io |
+| registry.k8s.io | registry.k8s.io |
+| Quay | quay.io |
+| GCR | gcr.io |
+| GHCR | ghcr.io |
+| Cloudsmith | docker.cloudsmith.io |
+| ECR Public | public.ecr.aws |
+
+## Docker 配置示例
+
+1. 设置镜像加速
 ```bash
-git clone <repository-url>
-cd docker-registry-proxy
+# 将 dockerhub.xxx.com 替换为你的 Workers 域名
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<EOF
+{
+  "registry-mirrors": ["https://dockerhub.xxx.com"]
+}
+EOF
+systemctl daemon-reload
+systemctl restart docker
 ```
 
-2. 安装依赖
+2. 查询镜像
 ```bash
-npm install
-```
-
-3. 配置环境变量
-```bash
-cp wrangler.toml.example wrangler.toml
-```
-
-4. 部署到 Cloudflare Workers
-```bash
-wrangler deploy
-```
-
-## 配置说明
-
-### 必需配置
-```toml
-PROXY_HOSTNAME = "registry-1.docker.io"  # Docker Registry 主机名
-PROXY_PROTOCOL = "https"                 # 代理协议
-REQUEST_TIMEOUT = 60000                  # 请求超时时间（毫秒）
-```
-
-### 可选配置
-```toml
-# 访问控制
-PATHNAME_REGEX = ""          # 路径过滤正则表达式
-UA_WHITELIST_REGEX = ""      # User-Agent 白名单
-UA_BLACKLIST_REGEX = ""      # User-Agent 黑名单
-IP_WHITELIST_REGEX = ""      # IP 白名单
-IP_BLACKLIST_REGEX = ""      # IP 黑名单
-REGION_WHITELIST_REGEX = ""  # 地区白名单
-REGION_BLACKLIST_REGEX = ""  # 地区黑名单
-
-# 其他选项
-DEBUG = false               # 调试模式
-URL302 = ""                # 访问被拒绝时的重定向 URL
-```
-
-## 使用示例
-
-### 基础配置示例
-最小化配置，仅包含必需选项：
-```toml
-[vars]
-PROXY_HOSTNAME = "registry-1.docker.io"
-PROXY_PROTOCOL = "https"
-REQUEST_TIMEOUT = 60000
-```
-
-### 访问控制配置示例
-添加基本的访问控制：
-```toml
-[vars]
-PROXY_HOSTNAME = "registry-1.docker.io"
-PROXY_PROTOCOL = "https"
-REQUEST_TIMEOUT = 60000
-PATHNAME_REGEX = "^/v2/"
-UA_WHITELIST_REGEX = "^docker/\\d+\\.\\d+\\.\\d+.*$"
-```
-
-### 完整配置示例
-包含所有可选功能的配置：
-```toml
-[vars]
-# 基础配置
-PROXY_HOSTNAME = "registry-1.docker.io"
-PROXY_PROTOCOL = "https"
-REQUEST_TIMEOUT = 60000
-
-# 访问控制
-PATHNAME_REGEX = "^/v2/"
-UA_WHITELIST_REGEX = "^docker/\\d+\\.\\d+\\.\\d+.*$"
-UA_BLACKLIST_REGEX = ""
-IP_WHITELIST_REGEX = ""
-IP_BLACKLIST_REGEX = ""
-REGION_WHITELIST_REGEX = "^(US|EU)$"
-REGION_BLACKLIST_REGEX = ""
-
-# 其他选项
-DEBUG = false
-URL302 = "https://example.com/blocked"
+docker search dockerhub.xxx.com/image_name
 ```
 
 ## 监控与日志
 
-### 可用指标
-服务自动收集以下指标：
-- 请求总数
-- 错误数和错误率
-- 超时数和超时率
+### 指标收集
+- 请求总数和错误率
+- 超时次数和重试次数
 - 传输字节数
 - 请求处理时间
 
-### 日志格式
-正常请求日志：
-```json
-{
-  "requestId": "uuid",
-  "method": "GET",
-  "url": "https://example.com/v2/...",
-  "status": 200,
-  "duration": 150,
-  "userAgent": "docker/20.10.21",
-  "clientIp": "1.2.3.4",
-  "timestamp": "2024-10-25T10:00:00.000Z"
-}
-```
+### 日志记录
+- 详细的请求/响应日志
+- 错误追踪和诊断信息
+- 性能监控数据
 
-错误日志：
-```json
-{
-  "requestId": "uuid",
-  "message": "Request timeout",
-  "type": "REQUEST_TIMEOUT",
-  "statusCode": 504,
-  "clientIp": "1.2.3.4",
-  "userAgent": "docker/20.10.21",
-  "url": "https://example.com/v2/...",
-  "timestamp": "2024-10-25T10:00:00.000Z"
-}
-```
+## 注意事项
 
-## 故障排除
-
-### 常见问题
-
-1. TLS 握手超时
-```
-问题：failed to do request: Head "xxx": net/http: TLS handshake timeout
-解决：增加 REQUEST_TIMEOUT 值，建议设置为 60000（60秒）
-```
-
-2. 访问被拒绝
-```
-问题：Access denied
-解决：检查访问控制配置，确保 IP、User-Agent 和地区设置正确
-```
-
-3. 代理连接失败
-```
-问题：Failed to connect to proxy host
-解决：确认 PROXY_HOSTNAME 和 PROXY_PROTOCOL 配置正确
-```
-
-### 最佳实践
-
-1. 超时设置
-- 设置合理的请求超时时间（建议 60 秒）
-- 生产环境建议启用重试机制
-
-2. 访问控制
-- 谨慎使用 IP 和地区限制
-- 设置合适的 User-Agent 白名单
-
-3. 安全建议
-- 及时更新 Cloudflare Workers 运行时
-- 定期检查访问日志
-- 适当配置安全头
-
-4. 性能优化
-- 合理使用缓存配置
-- 监控并优化慢请求
-- 适时调整资源配置
+1. 建议自用，使用正则表达式过滤请求
+2. 设置 Workers 自定义域名
+3. 避免代理整个站点以防风控
+4. 定期检查访问日志和性能指标
 
 ## 许可证
 
-[License Type] - 详见 LICENSE 文件
+GPL-3.0 License
 
-## 贡献指南
+## 问题反馈
 
-1. Fork 项目
-2. 创建特性分支
-3. 提交变更
-4. 推送到分支
-5. 创建 Pull Request
-
-## 支持与帮助
-
-如有问题，请提交 Issue 或通过以下方式获取帮助：
-- 提交 Issue
-- 查看 Wiki
-- 参考示例配置
+如有问题，请提交 Issue 或查看 [cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy) 项目获取更多参考。
 
 ---
-希望这个工具能帮助你更好地管理 Docker Registry 代理！
+
+> 注：本项目仅供学习研究使用，请遵守相关法律法规。

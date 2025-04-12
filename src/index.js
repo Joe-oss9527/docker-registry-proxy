@@ -144,7 +144,7 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
     method: request.method,
     headers: newRequestHeaders,
     body: request.body,
-    redirect: 'manual'  // 添加这个重要参数
+    redirect: 'follow'  // 添加这个重要参数
   });
 }
 

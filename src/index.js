@@ -1,3 +1,5 @@
+import { WorkerLogger } from './logger.js';
+
 // 错误处理
 class ProxyError extends Error {
   constructor(message, statusCode, errorType) {
@@ -59,27 +61,19 @@ class Metrics {
   }
 }
 
-// 正则表达式缓存
-const regexCache = new Map();
-function getCachedRegex(pattern, flags = 'g') {
-  const key = `${pattern}|${flags}`;
-  if (!regexCache.has(key)) {
-    regexCache.set(key, new RegExp(pattern, flags));
-  }
-  return regexCache.get(key);
-}
-
 // 配置验证
-function validateConfig(env) {
+function validateConfig(env, logger = null) {
   const requiredConfigs = ['PROXY_HOSTNAME'];
   const missingConfigs = requiredConfigs.filter(key => !env[key]);
 
   if (missingConfigs.length > 0) {
-    throw new ProxyError(
+    const error = new ProxyError(
       `Missing required configurations: ${missingConfigs.join(', ')}`,
       500,
       'CONFIG_ERROR'
     );
+    if (logger) logger.configError(error);
+    throw error;
   }
 
   const regexConfigs = [
@@ -96,34 +90,24 @@ function validateConfig(env) {
     if (env[config]) {
       try {
         new RegExp(env[config]);
+        if (logger) {
+          logger.debug('config_validation', { 
+            config, 
+            status: 'valid',
+            pattern: env[config] 
+          });
+        }
       } catch (e) {
-        throw new ProxyError(
+        const error = new ProxyError(
           `Invalid regex in ${config}: ${e.message}`,
           500,
           'CONFIG_ERROR'
         );
+        if (logger) logger.configError(error);
+        throw error;
       }
     }
   }
-}
-
-// 判断请求类型
-function isManifestOrBlobRequest(pathname) {
-  return pathname.includes('/manifests/') || pathname.includes('/blobs/');
-}
-
-// 判断是否为认证请求
-function isAuthRequest(pathname) {
-  return pathname.includes('/token') || pathname.includes('/auth');
-}
-
-// 简化日志记录函数
-function logError(request, message) {
-  console.error(
-    `${message}, clientIp: ${request.headers.get(
-      "cf-connecting-ip"
-    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`
-  );
 }
 
 // 简化创建新请求的函数
@@ -257,12 +241,39 @@ export default {
       const url = new URL(request.url);
       const originHostname = url.hostname;
       
+      // 初始化日志器
+      const logger = new WorkerLogger();
+      logger.requestStart(request);
+      
+      // 记录指标开始
+      metrics.recordRequestStart(logger.getRequestId());
+      
+      // 设置全局 DEBUG 标志
+      if (DEBUG) {
+        globalThis.DEBUG = true;
+      }
+      
+      // 验证配置
+      try {
+        validateConfig(env, logger);
+      } catch (configError) {
+        metrics.recordError();
+        return new Response("Configuration Error", { status: 500 });
+      }
+      
       // 根据路径调整代理主机名
+      const originalProxyHostname = PROXY_HOSTNAME;
+      let routingReason = "default";
+      
       if (url.pathname.includes("/token")) {
         PROXY_HOSTNAME = "auth.docker.io";
+        routingReason = "token_endpoint";
       } else if (url.pathname.includes("/search")) {
         PROXY_HOSTNAME = "index.docker.io";
+        routingReason = "search_endpoint";
       }
+      
+      logger.proxyRouting(originalProxyHostname, PROXY_HOSTNAME, routingReason);
 
       // 访问控制检查
       if (!PROXY_HOSTNAME ||
@@ -292,7 +303,11 @@ export default {
               request.headers.get("cf-ipcountry")
             ))
       ) {
-        logError(request, "Invalid");
+        logger.accessDenied("access_control_failed", 
+          request.headers.get("cf-connecting-ip"),
+          request.headers.get("user-agent"),
+          url.pathname
+        );
         return URL302
           ? Response.redirect(URL302, 302)
           : new Response(await nginx(), {
@@ -305,8 +320,22 @@ export default {
       url.host = PROXY_HOSTNAME;
       url.protocol = PROXY_PROTOCOL;
 
+      const targetUrl = url.toString();
+      logger.proxyForward(targetUrl, PROXY_HOSTNAME);
+      
       const newRequest = createNewRequest(request, url, PROXY_HOSTNAME, originHostname);
+      const proxyStart = Date.now();
+      
       const originalResponse = await fetch(newRequest);
+      const proxyDuration = Date.now() - proxyStart;
+      
+      logger.proxyResponse(originalResponse, proxyDuration);
+      
+      // 记录错误响应的详细信息
+      if (originalResponse.status >= 400) {
+        logger.errorResponse(originalResponse, targetUrl);
+      }
+      
       const newResponseHeaders = setResponseHeaders(originalResponse, PROXY_HOSTNAME, originHostname, DEBUG);
       
       const contentType = newResponseHeaders.get("content-type") || "";
@@ -317,12 +346,22 @@ export default {
         body = originalResponse.body;
       }
 
+      // 记录指标
+      const contentLength = parseInt(originalResponse.headers.get('content-length')) || 0;
+      metrics.recordRequestEnd(logger.getRequestId(), contentLength);
+      if (originalResponse.status >= 400) {
+        metrics.recordError();
+      }
+      
+      logger.requestComplete(originalResponse.status, PROXY_HOSTNAME);
+      
       return new Response(body, {
         status: originalResponse.status,
         headers: newResponseHeaders,
       });
     } catch (error) {
-      logError(request, `Fetch error: ${error.message}`);
+      metrics.recordError();
+      logger.requestError(error, request.url);
       return new Response("Internal Server Error", { status: 500 });
     }
   },

@@ -124,12 +124,25 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
       );
     }
   }
-  return new Request(url.toString(), {
+  
+  // 确保SHA256格式正确（Docker blob请求）
+  const finalUrl = url.toString();
+  if (finalUrl.includes('/blobs/sha256:') && !isValidSHA256Path(finalUrl)) {
+    throw new ProxyError('Invalid SHA256 format in blob request', 400, 'INVALID_SHA256');
+  }
+  
+  return new Request(finalUrl, {
     method: request.method,
     headers: newRequestHeaders,
     body: request.body,
-    redirect: 'follow'  // 添加这个重要参数
+    redirect: 'follow'
   });
+}
+
+// 验证SHA256格式
+function isValidSHA256Path(url) {
+  const sha256Match = url.match(/\/blobs\/sha256:([a-f0-9]{64})(?:$|\/|\?)/);
+  return sha256Match && sha256Match[1].length === 64;
 }
 
 // 简化响应头处理函数
@@ -334,6 +347,16 @@ export default {
       // 记录错误响应的详细信息
       if (originalResponse.status >= 400) {
         logger.errorResponse(originalResponse, targetUrl);
+        
+        // 特别处理blob请求错误
+        if (url.pathname.includes('/blobs/sha256:')) {
+          logger.debug('blob_request_error', {
+            originalUrl: request.url,
+            targetUrl: targetUrl,
+            sha256: url.pathname.match(/sha256:([a-f0-9]{64})/)?.[1] || 'invalid',
+            status: originalResponse.status
+          });
+        }
       }
       
       const newResponseHeaders = setResponseHeaders(originalResponse, PROXY_HOSTNAME, originHostname, DEBUG);

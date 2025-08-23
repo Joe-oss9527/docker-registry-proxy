@@ -1,7 +1,7 @@
 #:schema node_modules/wrangler/config-schema.json
 name = "docker-registry-proxy"
 main = "src/index.js"
-compatibility_date = "2024-10-22"
+compatibility_date = "2025-08-22"
 compatibility_flags = ["nodejs_compat"]
 
 # Workers Logs

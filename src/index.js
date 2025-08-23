@@ -125,11 +125,8 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
     }
   }
   
-  // 确保SHA256格式正确（Docker blob请求）
+  // 移除SHA256验证，因为Docker Registry的blob请求格式是有效的
   const finalUrl = url.toString();
-  if (finalUrl.includes('/blobs/sha256:') && !isValidSHA256Path(finalUrl)) {
-    throw new ProxyError('Invalid SHA256 format in blob request', 400, 'INVALID_SHA256');
-  }
   
   return new Request(finalUrl, {
     method: request.method,
@@ -139,11 +136,6 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
   });
 }
 
-// 验证SHA256格式
-function isValidSHA256Path(url) {
-  const sha256Match = url.match(/\/blobs\/sha256:([a-f0-9]{64})(?:$|\/|\?)/);
-  return sha256Match && sha256Match[1].length === 64;
-}
 
 // 简化响应头处理函数
 function setResponseHeaders(
@@ -330,6 +322,19 @@ export default {
             });
       }
 
+      // 删除内部路由参数 'ns'，它不应该被发送到上游服务器
+      const hadNsParam = url.searchParams.has('ns');
+      url.searchParams.delete('ns');
+      
+      // 记录 ns 参数的删除
+      if (hadNsParam) {
+        logger.debug('removed_ns_param', {
+          originalUrl: request.url,
+          pathname: url.pathname,
+          removedParam: 'ns'
+        });
+      }
+      
       url.host = PROXY_HOSTNAME;
       url.protocol = PROXY_PROTOCOL;
 
